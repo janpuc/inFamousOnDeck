@@ -1,0 +1,201 @@
+name: Linux (native)
+
+# Native POSIX build of the toolkit and the port. This is the first stage of
+# Linux support: it compiles and runs the runtime, the host harness and the
+# port's runner against the synthetic smoke title -- no game data. The Vulkan
+# job also checks the opt-in renderer against Mesa's software Vulkan driver.
+#
+# Windows keeps its own workflow; nothing here builds or changes D3D12.
+
+on:
+  push:
+    branches: ["main", "linux/**"]
+    paths:
+      - "ps3recomp/**"
+      - "infamous-recomp/**"
+      - "docs/**"
+      - "linux/**"
+      - "tools/**"
+      - "README.md"
+      - "LICENSE"
+      - "THIRD_PARTY_NOTICES.md"
+      - "CONTRIBUTING.md"
+      - ".github/workflows/linux-native.yml"
+  pull_request:
+    paths:
+      - "ps3recomp/**"
+      - "infamous-recomp/**"
+      - "docs/**"
+      - "linux/**"
+      - "tools/**"
+      - "README.md"
+      - "LICENSE"
+      - "THIRD_PARTY_NOTICES.md"
+      - "CONTRIBUTING.md"
+      - ".github/workflows/linux-native.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: GCC
+            cc: gcc
+            cxx: g++
+          - name: Clang
+            cc: clang
+            cxx: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsdl2-dev
+
+      - name: Configure the runtime
+        run: |
+          cmake -S ps3recomp -B build-runtime -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DPS3RECOMP_BUILD_TESTS=ON
+
+      - name: Build the runtime
+        run: cmake --build build-runtime --parallel
+
+      - name: Run the runtime tests
+        run: ctest --test-dir build-runtime --output-on-failure
+
+      - name: Run the POSIX host harness
+        run: ./build-runtime/ps3recomp_host
+
+      - name: Run the PPU boot smoke title
+        run: ./build-runtime/ps3recomp_boot_smoke build-runtime/smoke/smoke.elf
+
+      # The smoke lift is written by the runtime configure above. It has no
+      # game code, so the port is built with its SPU lifts and trainer off;
+      # that still compiles and links every portable port source (main.cpp,
+      # stubs.cpp, the PPU scaffold and the runtime).
+      - name: Configure the port against the smoke lift
+        run: |
+          cmake -S infamous-recomp -B build-port -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DPS3RECOMP_DIR="$PWD/ps3recomp" \
+            -DRECOMP_DIR="$PWD/build-runtime/smoke/lift" \
+            -DPORT_ENABLE_SPU=OFF \
+            -DPORT_BUILD_TRAINER=OFF \
+            -DPORT_PPU_REGCACHE=OFF \
+            -DPORT_PGO=OFF \
+            -DPORT_CPU_AUTO=OFF
+
+      - name: Build the port
+        run: cmake --build build-port --parallel
+
+      - name: Boot the smoke title through the port runner
+        run: timeout 60 ./build-port/inFamousRecomp build-runtime/smoke/smoke.elf
+
+  vulkan:
+    name: Vulkan on lavapipe
+    runs-on: ubuntu-latest
+    env:
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsdl2-dev clang \
+            glslang-dev glslang-tools spirv-tools \
+            libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers
+
+      - name: Configure the runtime with Vulkan
+        run: |
+          cmake -S ps3recomp -B build-vk -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DPS3RECOMP_RSX_VULKAN=ON | tee configure.log
+          grep -q "Vulkan: *guest programs available" configure.log
+
+      - name: Build the Vulkan host harness
+        run: cmake --build build-vk --target ps3recomp_host ps3recomp_smoke_lift --parallel
+
+      - name: Fixed-function Vulkan path
+        run: ./build-vk/ps3recomp_host --draw
+
+      - name: Draw engine with guest programs, under the validation layer
+        env:
+          PS3RECOMP_VK_GUEST_PROGRAMS: "1"
+          VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+        run: |
+          fail=0
+          for m in --draw --depth --tex --quads --shader --mip --rtt \
+                   --depthtex --mrt --mrt-a --depthbounds; do
+            rc=0; ./build-vk/ps3recomp_host $m > run.log 2>&1 || rc=$?
+            echo "::group::ps3recomp_host $m -> exit $rc"; cat run.log; echo "::endgroup::"
+            # depthBounds is an optional Vulkan device feature. A known
+            # unsupported device is a skip, not a passing pixel test.
+            if [ "$m" = "--depthbounds" ] && [ "$rc" -eq 77 ] \
+              && grep -q "skipped, no depth bounds test" run.log; then
+              echo "::notice::$m: skipped, device has no depthBounds support"
+              continue
+            fi
+            [ "$rc" -eq 0 ] || { echo "::error::$m: exit $rc"; fail=1; }
+            if grep -q "VUID" run.log; then
+              echo "::error::$m: Vulkan validation messages"; fail=1
+            fi
+            grep -q "register-file draw engine path" run.log \
+              || { echo "::error::$m: not on the draw engine"; fail=1; }
+            grep -q "MISMATCH" run.log \
+              && { echo "::error::$m: pixel mismatch"; fail=1; }
+            if ! grep -q "presented pixel: .* OK" run.log; then
+              echo "::error::$m: no verified pixel"; fail=1
+            fi
+            case "$m" in
+              --tex|--shader|--mip|--rtt|--depthtex|--mrt|--mrt-a)
+                grep -q "draws through guest programs: [1-9][0-9]* OK" run.log \
+                  || { echo "::error::$m: no guest-program draws verified"; fail=1; }
+                ;;
+            esac
+          done
+          exit $fail
+
+      - name: Build the port against the smoke lift with Vulkan
+        run: |
+          cmake -S infamous-recomp -B build-port-vk -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DPS3RECOMP_DIR="$PWD/ps3recomp" \
+            -DRECOMP_DIR="$PWD/build-vk/smoke/lift" \
+            -DPS3RECOMP_RSX_VULKAN=ON \
+            -DPORT_ENABLE_SPU=OFF \
+            -DPORT_BUILD_TRAINER=OFF \
+            -DPORT_PPU_REGCACHE=OFF \
+            -DPORT_PGO=OFF \
+            -DPORT_CPU_AUTO=OFF
+          cmake --build build-port-vk --parallel
+
+      - name: Boot the smoke title through the Vulkan port runner
+        run: PS3RECOMP_VK_WINDOW=0 timeout 60 ./build-port-vk/inFamousRecomp build-vk/smoke/smoke.elf
+
+  steamdeck-checks:
+    name: Launcher tests and public-tree gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run launcher and packaging unit tests
+        run: python3 -m unittest discover -s linux/steamdeck/tests -v
+
+      - name: Check shell script syntax
+        run: bash -n linux/steamdeck/install.sh linux/steamdeck/build.sh linux/steamdeck/play.sh linux/infamous-native.sh
+
+      - name: Run public-tree gate
+        run: python3 tools/check_public_tree.py .

@@ -1,0 +1,22 @@
+# The build container of the native Linux port for SteamOS.
+#
+# The Steam Runtime 4 SDK image is the base: Clang 19.1.7, CMake, Ninja, glslang,
+# SPIRV-Tools, SDL3 and Python 3.13. It is the toolchain the native build was
+# verified with on the Steam Deck.
+FROM registry.gitlab.steamos.cloud/steamrt/steamrt4/sdk:latest
+
+# lld links the big binaries, ccache keeps a rebuild short, and pip installs the
+# Python packages the lift tools need.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      lld \
+      ccache \
+      python3-pip \
+      python3-venv \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV CCACHE_DIR=/ccache
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /work

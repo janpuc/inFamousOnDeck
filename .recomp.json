@@ -1,0 +1,22 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "inFamous",
+  "system": "PS3",
+  "type": "recomp",
+  "original": {
+    "region": "Europe",
+    "serial": "BCES00220"
+  },
+  "project": "inFamousOnDeck",
+  "status": "playable",
+  "targets": ["Linux", "SteamOS"],
+  "toolchain": "ps3recomp",
+  "approach": "Static recompilation of the PPU and SPU code to x86-64 with a native Vulkan runtime, FSR 3.1.5 upscaling, FSR 3.1.6 frame generation, and SDL3 input and haptics",
+  "maintainers": [
+    {
+      "name": "inFamousOnDeck contributors",
+      "link": "https://github.com/janpuc/inFamousOnDeck"
+    }
+  ],
+  "notes": "Native Steam Deck and Linux (Vulkan) port built from the player's own European BCES00220 disc dump. No game code, firmware, or assets are distributed."
+}
